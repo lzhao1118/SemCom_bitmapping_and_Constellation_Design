@@ -214,7 +214,7 @@ class WITT(nn.Module):
 
     def feature_pass_channel(self, feature, chan_param, avg_pwr=False):
         device = feature.device
-        logits,y_prob,feature_dis = self.resample(feature,self.tau,self.tau_lg)
+        logits,y_prob,feature_dis = self.resample(feature,self.tau,self.tau_lg)   #feature_dis是 0/1 的离散比特
         # uniform_noise = (torch.rand_like(feature, device=device) - 0.5) * (1/256) # 8 bit width
         # feature = feature + uniform_noise
         # noisy_feature = self.channel.forward(feature_dis, chan_param, avg_pwr)
@@ -245,11 +245,11 @@ class WITT(nn.Module):
         # 计算压缩比率(CBR)
         CBR = feature.numel() / 2 / input_image.numel()
         
-        # 特征通过信道
+        # 特征软比特离散化（量化）
         if self.pass_channel:
             logits,y_prob, noisy_feature = self.feature_pass_channel(feature, chan_param)
         else:
-            noisy_feature = feature 
+            noisy_feature = feature  #代码有误，可能输出浮点数
         # print(noisy_feature.shape)
         received, received_llr = QPSK_soft(noisy_feature, given_SNR)
     
