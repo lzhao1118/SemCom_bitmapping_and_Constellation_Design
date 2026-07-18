@@ -27,6 +27,7 @@ class Mlp(nn.Module):
 
 def window_partition(x, window_size):
     """
+    分隔
     Args:
         x: (B, H, W, C)
         window_size (int): window size
@@ -41,6 +42,7 @@ def window_partition(x, window_size):
 
 def window_reverse(windows, window_size, H, W):
     """
+    恢复
     Args:
         windows: (num_windows*B, window_size, window_size, C)
         window_size (int): Window size

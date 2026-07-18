@@ -1,4 +1,3 @@
-import torch.optim as optim
 from network.network import WITT, QPSK_soft
 from data.datasets import get_loader
 from utils import *
@@ -11,12 +10,7 @@ import torch.nn as nn
 import argparse
 from loss.distortion import *
 import time
-from torch.optim.lr_scheduler import ReduceLROnPlateau
-import torch.nn.utils as utils
-import traceback
 from thop import profile
-from torch.optim.lr_scheduler import StepLR
-from tensorboardX import SummaryWriter
 
 print("All imports successful!")
 
@@ -114,45 +108,45 @@ def random_bit_flip(tensor, flip_prob=0.1):
     torch.Tensor: 经过随机翻转后的 tensor。
     """
     rand_matrix = torch.rand_like(tensor, dtype=torch.float)  # 生成与 tensor 形状相同的随机概率矩阵
-    
+
     flip_mask = (rand_matrix < flip_prob).to(torch.int8)  # 转换为 int8 掩码
-    flipped_tensor = (tensor.to(torch.int8) ^ flip_mask).to(tensor.dtype)  
+    flipped_tensor = (tensor.to(torch.int8) ^ flip_mask).to(tensor.dtype)
     return flipped_tensor
 
 def tensor_to_bitstream(tensor, bit_width):
     if bit_width < 1 or bit_width > 32:
         raise ValueError("Bit width should be between 1 and 32")
-    
+
     max_val = torch.max(tensor)
     min_val = torch.min(tensor)
     range_val = max_val - min_val
     n_levels = 2 ** bit_width
     step_size = range_val / (n_levels - 1)
-    
+
     quantized_tensor = torch.round((tensor - min_val) / step_size)
     quantized_tensor = torch.clamp(quantized_tensor, 0, n_levels - 1)  # Ensure values stay within valid range
-    
+
     # Convert to bitstream (binary string)
     bitstream = []
     for q in quantized_tensor.view(-1):
         # Convert each quantized value to binary with a fixed number of bits
         bitstring = format(int(q.item()), f'0{bit_width}b')  # Fixed-length binary representation
         bitstream.append(bitstring)
-    
+
     return ''.join(bitstream), min_val, step_size, n_levels, tensor.shape
 
 def bitstream_to_tensor(bitstream, bit_width, min_val, step_size, n_levels,original_shape):
     # Convert the bitstream back to quantized values
     num_values = len(bitstream) // bit_width
     quantized_tensor = []
-    
+
     for i in range(num_values):
         bitstring = bitstream[i * bit_width: (i + 1) * bit_width]
         quantized_value = int(bitstring, 2)
         quantized_tensor.append(quantized_value)
-    
+
     quantized_tensor = torch.tensor(quantized_tensor, dtype=torch.float32).view(original_shape).to(config.device)
-    
+
     # Dequantize to get the tensor values
     dequantized_tensor = quantized_tensor * step_size + min_val
     return dequantized_tensor
@@ -161,44 +155,44 @@ def introduce_bit_errors(bitstream, ber):
     bitstream = list(bitstream)
     num_bits = len(bitstream)
     num_errors = int(ber * num_bits)
-    
+
     error_indices = np.random.choice(num_bits, num_errors, replace=False)
-    
+
     # Flip the bits at the error indices
     for idx in error_indices:
         bitstream[idx] = '1' if bitstream[idx] == '0' else '0'
-    
+
     return ''.join(bitstream)
 
 
 def introduce_bit_errors_segments(bitstream, ber, num_segments):
     bitstream = list(bitstream)
     num_bits = len(bitstream)
-    
+
     # 计算每段的长度，并对比特流进行分段
     segment_length = num_bits // num_segments
     segments = [bitstream[i * segment_length:(i + 1) * segment_length] for i in range(num_segments)]
-    
+
     # 如果不能整除，将剩余比特附加到最后一段
     if num_bits % num_segments != 0:
         segments[-1].extend(bitstream[num_segments * segment_length:])
-    
+
     # 随机选择一个段
     selected_segment_index = np.random.choice(num_segments)
     selected_segment = segments[selected_segment_index]
-    
+
     # 在选定的段内引入误码
     num_errors = int(ber * len(selected_segment))
     error_indices = np.random.choice(len(selected_segment), num_errors, replace=False)
-    
+
     # 翻转选定段的比特
     for idx in error_indices:
         selected_segment[idx] = '1' if selected_segment[idx] == '0' else '0'
-    
+
     # 将各段重新组合成完整的比特流
     segments[selected_segment_index] = selected_segment
     bitstream = ''.join(''.join(segment) for segment in segments)
-    
+
     return bitstream
 
 
@@ -267,10 +261,10 @@ class config():
             test_data_dir = ["/media/Dataset/CLIC21/"]
         elif args.testset == 'DIV2K':
             test_data_dir = ["/data/zhs/WITT/media/DIV2K_valid_HR/DIV2K_valid_HR"]
-        
+
         elif args.testset == 'DIV2K_fix':
             test_data_dir = ["DIV2K"]
-        
+
         elif args.testset == 'NEW_TEST':
             test_data_dir = ["NEW_TEST"]
 
@@ -288,7 +282,7 @@ class config():
             C=args.C, window_size=8, mlp_ratio=4., qkv_bias=True, qk_scale=None,
             norm_layer=nn.LayerNorm, patch_norm=True,
         )
-    
+
     # 确保工作目录存在
     os.makedirs(workdir, exist_ok=True)
 
@@ -308,159 +302,13 @@ def load_weights_false(model_path):
     del pretrained
 
 
-def train_one_epoch(args,batch_snr):
-    net.train()
-    elapsed, losses, psnrs, msssims, cbrs, snrs = [AverageMeter() for _ in range(6)]
-    metrics = [elapsed, losses, psnrs, msssims, cbrs, snrs]
-    
-    global global_step
-    total_loss = 0
-    batch_count = 0
-    results = np.zeros((len(train_loader), 4))
-    for batch_idx, data in enumerate(train_loader):
-        start_time = time.time()
-        global_step += 1
-        input = data.cuda() if isinstance(data, torch.Tensor) else data[0].cuda()
-        recon_image, CBR, SNR, mse, loss_G = net(input,batch_snr)
-        loss = loss_G
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-        
-        # 更新指标
-        elapsed.update(time.time() - start_time)
-        losses.update(loss.item())
-        cbrs.update(CBR)
-        snrs.update(SNR)
-        
-        if mse.item() > 0:
-            psnr = 10 * (torch.log(255. * 255. / mse) / np.log(10))
-            psnrs.update(psnr.item())
-            msssim = 1 - CalcuSSIM(input, recon_image.clamp(0., 1.)).mean().item()
-            msssims.update(msssim)
-        else:
-            psnrs.update(100)
-            msssims.update(100)
-        
-        total_loss += loss.item()
-        batch_count += 1
-        
-        if (global_step % config.print_step) == 0:
-            process = (global_step % train_loader.__len__()) / (train_loader.__len__()) * 100.0
-            print(' | '.join([
-                f'Epoch {epoch}',
-                f'Step [{global_step % train_loader.__len__()}/{train_loader.__len__()}={process:.2f}%]',
-                f'Time {elapsed.val:.3f}',
-                f'Loss {losses.val:.3f} ({losses.avg:.3f})',
-                f'CBR {cbrs.val:.4f} ({cbrs.avg:.4f})',
-                f'SNR {snrs.val:.1f} ({snrs.avg:.1f})',
-                f'PSNR {psnrs.val:.3f} ({psnrs.avg:.3f})',
-                f'MSSSIM {msssims.val:.3f} ({msssims.avg:.3f})',
-                f'Lr {cur_lr}',
-            ]))
-        results[batch_idx-1] =[mse.item(), CBR, psnr.item(), msssim]
-        # 计算平均损失
-    cbr_,psnr_,ssim_ = results[:,1].mean(),results[:,2].mean(),results[:,3].mean()
-    avg_loss = total_loss / batch_count if batch_count > 0 else float('inf')
-    
-    writer.add_scalar('Train/PSNR', psnr_, epoch)
-    writer.add_scalar('Train/SSIM', ssim_, epoch)
-    writer.add_scalar('Train/AvgLoss', avg_loss, epoch)
-
-    print(f"Epoch completed with average loss: {avg_loss}")
-
-    return avg_loss
-        
-
-def test(batch_snr):
-    config.isTrain = False
-    net.eval()
-    elapsed, psnrs, msssims, snrs, cbrs = [AverageMeter() for _ in range(5)]
-    metrics = [elapsed, psnrs, msssims, snrs, cbrs]
-    multiple_snr = args.multiple_snr.split(",")
-    for i in range(len(multiple_snr)):
-        multiple_snr[i] = int(multiple_snr[i])
-    results_snr = np.zeros(len(multiple_snr))
-    results_cbr = np.zeros(len(multiple_snr))
-    results_psnr = np.zeros(len(multiple_snr))
-    results_msssim = np.zeros(len(multiple_snr))
-    for i, SNR in enumerate(multiple_snr):
-        with torch.no_grad():
-            if args.trainset == 'CIFAR10':
-                for batch_idx, (input, label) in enumerate(test_loader):
-                    start_time = time.time()
-                    input = input.cuda()
-                    recon_image, CBR, SNR, mse, loss_G = net(input, batch_snr)
-                    elapsed.update(time.time() - start_time)
-                    cbrs.update(CBR)
-                    snrs.update(SNR)
-                    if mse.item() > 0:
-                        psnr = 10 * (torch.log(255. * 255. / mse) / np.log(10))
-                        psnrs.update(psnr.item())
-                        msssim = 1 - CalcuSSIM(input, recon_image.clamp(0., 1.)).mean().item()
-                        msssims.update(msssim)
-                    else:
-                        psnrs.update(100)
-                        msssims.update(100)
-
-                    print(' | '.join([
-                        f'Time {elapsed.val:.3f}',
-                        f'CBR {cbrs.val:.4f} ({cbrs.avg:.4f})',
-                        f'SNR {snrs.val:.1f}',
-                        f'PSNR {psnrs.val:.3f} ({psnrs.avg:.3f})',
-                        f'MSSSIM {msssims.val:.3f} ({msssims.avg:.3f})',
-                        f'Lr {cur_lr}',
-                    ]))
-            else:
-                for batch_idx, input in enumerate(test_loader):
-                    start_time = time.time()
-                    input = input.cuda()
-                    recon_image, CBR, SNR, mse, loss_G = net(input, batch_snr)
-                    elapsed.update(time.time() - start_time)
-                    cbrs.update(CBR)
-                    snrs.update(SNR)
-                    if mse.item() > 0:
-                        psnr = 10 * (torch.log(255. * 255. / mse) / np.log(10))
-                        psnrs.update(psnr.item())
-                        msssim = 1 - CalcuSSIM(input, recon_image.clamp(0., 1.)).mean().item()
-                        msssims.update(msssim)
-                    else:
-                        psnrs.update(100)
-                        msssims.update(100)
-
-                    print(' | '.join([
-                        f'Time {elapsed.val:.3f}',
-                        f'CBR {cbrs.val:.4f} ({cbrs.avg:.4f})',
-                        f'SNR {snrs.val:.1f}',
-                        f'PSNR {psnrs.val:.3f} ({psnrs.avg:.3f})',
-                        f'MSSSIM {msssims.val:.3f} ({msssims.avg:.3f})',
-                        f'Lr {cur_lr}',
-                    ]))
-        results_snr[i] = snrs.avg
-        results_cbr[i] = cbrs.avg
-        results_psnr[i] = psnrs.avg
-        results_msssim[i] = msssims.avg
-        for t in metrics:
-            t.clear()
-
-    writer.add_scalar('Test/PSNR',results_psnr[0], epoch)
-    writer.add_scalar('Test/SSIM', results_msssim[0], epoch)
-
-    print("SNR: {}" .format(results_snr.tolist()))
-    print("CBR: {}".format(results_cbr.tolist()))
-    print("PSNR: {}" .format(results_psnr.tolist()))
-    print("MS-SSIM: {}".format(results_msssim.tolist()))
-    print("Finish Test!")
-
-
-
 def test_woruns():
     config.isTrain = False
     net.eval()
     enc_times,dec_times, psnrs, msssims, snrs, cbrs,lpipss = [AverageMeter() for _ in range(7)]
     metrics = [enc_times,dec_times, psnrs, msssims, snrs, cbrs,lpipss]
     loss_fn_alex = lpips.LPIPS(net='alex').cuda()  # 或 'vgg', 'squeeze'
-    
+
     multiple_snr = args.multiple_snr.split(",")
     for i in range(len(multiple_snr)):
         multiple_snr[i] = int(multiple_snr[i])
@@ -479,18 +327,18 @@ def test_woruns():
                 if args.param:
                     flops_encoder, params_encoder = profile(net.encoder, inputs=(input,SNR,net.model,))
                 enc_begin = time.time()
-                
+
                 logits, y_prob, feature = net.Encoder(input, args.test_snr)
-                
-                    
+
+
                 enc_time = time.time() - enc_begin
-                
+
                 received, received_Prob = QPSK_soft(feature, args.test_snr)
-                
+
                 if batch_idx == 2:
                     output_dir = "./test_probs_C%s/tau_%s" % (args.C,args.tau)
                     os.makedirs(output_dir, exist_ok=True)  # 如果目录已存在，不会报错
-                    
+
                     import matplotlib.pyplot as plt
                     logits_flat = logits[...,1].detach().cpu().numpy().reshape(-1)
                     y_prob_flat = y_prob[...,1].detach().cpu().numpy().reshape(-1)
@@ -499,8 +347,8 @@ def test_woruns():
                     np.save(os.path.join(output_dir, "y_prob_flat_%sdB.npy" % args.test_snr), y_prob_flat)
                     np.save(os.path.join(output_dir, "rx_prob_flat_%sdB.npy" % args.test_snr), rx_prob_flat)
 
-            
-                    
+
+
                     plt.figure(figsize=(6, 4))
                     plt.hist(logits_flat, bins=200)
                     # plt.scatter(logits_flat)
@@ -510,7 +358,7 @@ def test_woruns():
                     plt.grid(True)
                     plt.tight_layout()
                     plt.savefig(os.path.join(output_dir, "logits_%sdB.png" % args.test_snr), dpi=300)
-                    
+
                     plt.figure(figsize=(6, 4))
                     plt.hist(y_prob_flat, bins=200)
                     # plt.scatter(y_prob_flat)
@@ -520,7 +368,7 @@ def test_woruns():
                     plt.grid(True)
                     plt.tight_layout()
                     plt.savefig(os.path.join(output_dir, "Probs_%sdB.png" % args.test_snr), dpi=300)
-                    
+
                     plt.figure(figsize=(6, 4))
                     plt.hist(rx_prob_flat, bins=200)
                     # plt.scatter(y_prob_flat)
@@ -530,8 +378,8 @@ def test_woruns():
                     plt.grid(True)
                     plt.tight_layout()
                     plt.savefig(os.path.join(output_dir, "Rx_Probs_%sdB.png" % args.test_snr), dpi=300)
-                    
-                    
+
+
 
                 # bitstream, min_val, step_size, n_levels,tensor_shape = tensor_to_bitstream(feature, args.quantize)
                 # print(tensor_shape)
@@ -545,10 +393,10 @@ def test_woruns():
                 # feature = random_bit_flip(feature, flip_prob=args.bit_error)
 
                 CPR = feature.numel()/(256*256*3*8)
-                
+
                 if args.param:
                     flops_decoder, params_decoder = profile(net.decoder, inputs=(received_Prob,args.test_snr,net.model,))
-                
+
                 dec_begin = time.time()
                 recon_image, CBR, SNR, mse, loss_G = net.Decoder(input, received_Prob, args.test_snr)
                 dec_time = time.time()-dec_begin
@@ -582,13 +430,13 @@ def test_woruns():
                         output_folder = './Image_samples/' + args.testset+'_output'
                     else:
                         output_folder = args.testset+'_output_%s_seg%s'%(args.bit_error,args.segment)
-                    os.makedirs(output_folder, exist_ok=True) 
+                    os.makedirs(output_folder, exist_ok=True)
                     recon_image_np = recon_image.squeeze().cpu().clamp(0, 1).numpy()  # 转换为 NumPy 数组
                     recon_image_np = (recon_image_np * 255).astype(np.uint8).transpose(1, 2, 0)
                     print(recon_image_np.shape)
                     if recon_image_np.shape[0] == 1:
                         recon_image_np = recon_image_np[0]
-                    
+
                     recon_img = Image.fromarray(recon_image_np)
                     recon_img.save(os.path.join(output_folder, f"recon_img_{batch_idx}_{CPR:.4f}_p{psnr.item():3f}_s{msssim:.3f}.png"))
         results_enct[i] = enc_times.avg
@@ -600,7 +448,7 @@ def test_woruns():
         results_lpips[i] = lpipss.avg
         for t in metrics:
             t.clear()
-    
+
     print("CPR: {}" .format(CPR))
     print("Enc time: {}" .format(results_enct.tolist()))
     print("Dec time: {}" .format(results_dect.tolist()))
@@ -626,12 +474,12 @@ if __name__ == '__main__':
     # 初始化阶段
     print("Initializing random seed...")
     seed_torch()
-    
+
     print("Setting up logger...")
     logger = logger_configuration(config, save_log=True)
     print("Config details:")
     print(config.__dict__)
-    
+
     print("Setting up model...")
     torch.manual_seed(seed=config.seed)
     net = WITT(args, config)
@@ -642,73 +490,14 @@ if __name__ == '__main__':
         print('*' * 50)
         print('load model parameters ...')
 
-
-    
-    print("Setting up optimizer...")
-    model_params = [{'params': net.parameters(), 'lr': args.lr}]
-    
     print("Loading datasets...")
     train_loader, test_loader = get_loader(args, config)
 
-    cur_lr = config.learning_rate
-    optimizer = optim.Adam(model_params, lr=cur_lr)
-    global_step = 0
-    steps_epoch = global_step // train_loader.__len__()
-    print(f"Steps per epoch: {steps_epoch}")
-
-    # 设置学习率调度器
-    print("Setting up learning rate scheduler...")
-    # scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=config.lr_factor, 
-    #                             patience=config.patience, min_lr=config.min_lr)
-    scheduler = StepLR(optimizer, step_size=args.step, gamma=args.decay)
-    # 设置早停
-    best_loss = float('inf')
-    no_improve = 0
-    min_lr = args.min_lr
     if args.training:
-        if args.pretrain=='':
-            if args.pass_channel== False:
-                writer = SummaryWriter(log_dir='./runs_tb_kodak/BitSC_Prob/'+'%s_C%s_lr%s_snr%s_%s/'%(args.px,args.C,args.lr,args.snr_min,args.snr_max))
-            if args.pass_channel == True:
-                writer = SummaryWriter(log_dir='./runs_tb_kodak/BitSC_Prob/'+'%s_C%s_lr%s_pc_snr%s_%s/'%(args.px,args.C,args.lr,args.snr_min,args.snr_max))
-        elif args.pretrain!='':
-            if args.pass_channel== False:
-                writer = SummaryWriter(log_dir='./runs_tb_kodak/BitSC_Prob/'+'%s_Pre_C%s_lr%s_snr%s_%s/'%(args.px,args.C,args.lr,args.snr_min,args.snr_max))
-            if args.pass_channel == True:
-                writer = SummaryWriter(log_dir='./runs_tb_kodak/BitSC_Prob/'+'%s_Pre_C%s_lr%s_pc_snr%s_%s/'%(args.px,args.C,args.lr,args.snr_min,args.snr_max))
-
-        print("=== Starting training loop ===")
-        for epoch in range(steps_epoch, config.tot_epoch):
-            print(f"Current learning rate: {optimizer.param_groups[0]['lr']}")
-            writer.add_scalar('Train/LearningRate', optimizer.param_groups[0]['lr'], epoch)
-            batch_snr = random.randint(args.snr_min, args.snr_max)
-            try:
-                # 训练一个epoch
-                train_loss = train_one_epoch(args,batch_snr)
-                # 学习率调度
-                scheduler.step()
-                for param_group in optimizer.param_groups:
-                    cur_lr = param_group['lr']
-                    if param_group['lr'] < min_lr:
-                        param_group['lr'] = min_lr
-
-                # 定期保存和测试
-                if (epoch + 1) % config.save_model_freq == 0:
-                    print(f"=== Running periodic test at epoch {epoch + 1} ===")
-                    save_model(net, save_path=config.models + '/{}_EP{}.model'
-                                .format(config.filename, epoch + 1))
-                    test(batch_snr)
-                
-            except Exception as e:
-                print(f"Error during epoch {epoch}: {str(e)}")
-                print(f"Stack trace: {traceback.format_exc()}")
-                raise e
-            
+        from train import run_training
+        run_training(args, config, net, train_loader, test_loader, CalcuSSIM)
     else:
+        cur_lr = config.learning_rate
         epoch = 0
         print("=== Starting test mode ===")
         test_woruns()
-
-            
-
-
